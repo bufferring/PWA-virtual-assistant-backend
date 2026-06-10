@@ -1,6 +1,8 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.endpoints import router
+from fastapi.responses import ORJSONResponse
+from app.api.endpoints import router, llm_service
 from app.core.config import get_settings
 import logging
 
@@ -8,8 +10,20 @@ logging.basicConfig(level=logging.INFO)
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    yield
+    # Shutdown
+    await llm_service.close()
+
+
 app = FastAPI(
-    title=settings.PROJECT_NAME, openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse,
 )
 
 # CORS middleware

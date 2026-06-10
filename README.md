@@ -27,13 +27,12 @@ Diseñado para **producción** con streaming SSE, arquitectura desacoplada y des
 │                                                        │
 │  ┌──────────────┐        ┌─────────────────────┐      │
 │  │    CADDY     │───────▶│ FastAPI (Podman)    │      │
-│  │  :80 / :443  │ :8000  │ puerto 8000         │      │
+│  │  :80 / :443  │ :8000  │ --network=host      │      │
 │  │  (systemd)   │        │ usuario: appuser    │      │
 │  └──────────────┘        └──────────┬──────────┘      │
 │                                      │                 │
 │                                      │ HTTP            │
-│                                      │ host.containers │
-│                                      │ .internal:8080  │
+│                                      │ 127.0.0.1:8080  │
 │                                      ▼                 │
 │  ┌──────────────────────────────────────────────┐     │
 │  │ llama-server (systemd - binario nativo)      │     │
@@ -46,7 +45,7 @@ Diseñado para **producción** con streaming SSE, arquitectura desacoplada y des
 **¿Por qué esta arquitectura?**
 
 - **llama-server en systemd**: Máximo rendimiento con acceso directo a GPU/CPU sin overhead de contenedor
-- **FastAPI en Podman**: Aislamiento del código Python, fácil despliegue y reproducibilidad
+- **FastAPI en Podman con --network=host**: Aislamiento del código Python, fácil despliegue y reproducibilidad, sin overhead de red
 - **Caddy como proxy inverso**: HTTPS automático, HTTP/3, y manejo de conexiones persistentes para streaming
 
 ## 📋 Requisitos previos
@@ -54,7 +53,7 @@ Diseñado para **producción** con streaming SSE, arquitectura desacoplada y des
 ### En el servidor host
 
 - **Linux** (probado en Debian/Ubuntu, Fedora)
-- **Podman** >= 4.0 (no Docker, para `host.containers.internal`)
+- **Podman** >= 4.0
 - **Caddy** >= 2.7
 - **Python** 3.12+ (solo para desarrollo local)
 - **uv** >= 0.4 (gestor de paquetes)
@@ -102,7 +101,7 @@ Crea un archivo `.env` en la raíz del proyecto (ya está en `.gitignore`):
 
 ```env
 # URL del llama-server en el host
-LLAMA_SERVER_URL=http://host.containers.internal:8080
+LLAMA_SERVER_URL=http://127.0.0.1:8080
 
 # Timeout para respuestas del LLM (segundos)
 LLAMA_TIMEOUT=300
@@ -113,8 +112,6 @@ API_KEY=tu-super-secreto-aqui
 # CORS - dominios permitidos (cambia en producción)
 CORS_ORIGINS=["https://tu-dominio.com"]
 ```
-
-> 💡 **Nota**: `host.containers.internal` es el hostname especial de Podman que resuelve al host desde dentro del contenedor.
 
 ## 💻 Desarrollo local
 
@@ -140,8 +137,7 @@ uv sync
 ### 3. Ejecutar FastAPI
 
 ```bash
-# Para desarrollo local, usa 127.0.0.1 en vez de host.containers.internal
-LLAMA_SERVER_URL=http://127.0.0.1:8080 uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload
 ```
 
 La API estará en `http://127.0.0.1:8000` y la documentación interactiva en `http://127.0.0.1:8000/v1/openapi.json`.
@@ -173,11 +169,16 @@ WorkingDirectory=/opt/llama-server
 
 ExecStart=/opt/llama-server/llama-server \
     --model /ruta/a/tu/modelo.gguf \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8080 \
     --ctx-size 4096 \
     --n-gpu-layers 99 \
-    --threads 8
+    --threads 8 \
+    --batch-size 512 \
+    --ubatch-size 512 \
+    --flash-attn \
+    --cont-batching \
+    --parallel 4
 
 Restart=on-failure
 RestartSec=5s
@@ -188,7 +189,7 @@ Environment="CUDA_VISIBLE_DEVICES=0"
 WantedBy=multi-user.target
 ```
 
-> ⚠️ **Importante**: `--host 0.0.0.0` es necesario para que el contenedor de FastAPI pueda conectarse.
+> ⚠️ **Importante**: `--host 127.0.0.1` es seguro porque FastAPI usa `--network=host` y puede acceder a localhost del host.
 
 Activar el servicio:
 
@@ -208,20 +209,18 @@ podman build -t fastapi-app:latest -f Containerfile .
 podman stop fastapi-app 2>/dev/null || true
 podman rm fastapi-app 2>/dev/null || true
 
-# Ejecutar nuevo contenedor
+# Ejecutar nuevo contenedor con --network=host
 podman run -d \
     --name fastapi-app \
+    --network=host \
     --env-file .env \
-    --network slirp4netns:allow_host_loopback=true \
-    -p 127.0.0.1:8000:8000 \
     --restart=always \
     fastapi-app:latest
 ```
 
 **Flags clave explicados:**
 - `--env-file .env`: Inyecta las variables sin embeberlas en la imagen
-- `--network slirp4netns:allow_host_loopback=true`: Habilita `host.containers.internal`
-- `-p 127.0.0.1:8000:8000`: Solo accesible desde localhost (Caddy)
+- `--network=host`: El contenedor usa la red del host directamente (cero overhead de red)
 - `--restart=always`: Reinicia si crashea
 
 ### Paso 3: Generar servicio systemd para el contenedor (opcional)
@@ -311,12 +310,20 @@ Endpoint raíz de verificación.
 
 ### El contenedor no puede conectar a llama-server
 
-1. Verifica que llama-server escuche en `0.0.0.0:8080` (no `127.0.0.1`)
-2. Prueba desde dentro del contenedor:
+1. Verifica que llama-server esté corriendo:
    ```bash
-   podman exec -it fastapi-app curl http://host.containers.internal:8080/health
+   sudo systemctl status llama-server
    ```
-3. Revisa que el contenedor tenga el flag `--network slirp4netns:allow_host_loopback=true`
+
+2. Prueba la conexión desde dentro del contenedor:
+   ```bash
+   podman exec -it fastapi-app curl http://127.0.0.1:8080/health
+   ```
+
+3. Verifica que el contenedor esté usando `--network=host`:
+   ```bash
+   podman inspect fastapi-app | grep NetworkMode
+   ```
 
 ### El streaming se corta o no funciona
 
